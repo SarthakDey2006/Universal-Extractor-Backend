@@ -17,4 +17,3 @@ COPY . .
 # Run Uvicorn using the shell format so Render can dynamically inject its $PORT variable
 # If $PORT isn't found (like testing locally), it automatically falls back to 8000
 CMD uvicorn backend:app --host 0.0.0.0 --port ${PORT:-8000}
-```
