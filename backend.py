@@ -145,7 +145,7 @@ def progress_hook(d):
 
 @app.post("/api/info")
 def get_video_info(req: VideoRequest):
-    ydl_opts = {'quiet': True, 'cookiefile': 'cookies.txt', 'no_warnings': True, 'extract_flat': False}
+    ydl_opts = {'quiet': True, 'cookiefile': 'cookies.txt', 'extractor_args': {'youtube': ['player_client=android']}, 'no_warnings': True, 'extract_flat': False}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(req.url, download=False)
@@ -191,6 +191,7 @@ def download_video(req: DownloadRequest, background_tasks: BackgroundTasks):
         'merge_output_format': 'mp4' if req.quality != "audio" else None,
         'outtmpl': file_template,
         'cookiefile': 'cookies.txt',
+        'extractor_args': {'youtube': ['player_client=android']},
         'quiet': True,
         'noplaylist': True,
         'logger': QuietLogger(),
