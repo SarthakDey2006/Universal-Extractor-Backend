@@ -7,7 +7,7 @@ import uuid
 import json
 import logging
 import asyncio
-import urllib.request
+import requests
 from fastapi.responses import FileResponse
 import google.generativeai as genai
 
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Configure CORS (Matches your Vercel URL exactly)
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -35,8 +35,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_KEY_HERE")
 genai.configure(api_key=GEMINI_API_KEY)
 
 # --- ENTERPRISE SECURITY GUARDS ---
-MAX_DURATION_SECONDS = 14400  # 4 Hours maximum video length
-MAX_CONCURRENT_DOWNLOADS = 3  # Prevent server crashing
+MAX_DURATION_SECONDS = 14400  
+MAX_CONCURRENT_DOWNLOADS = 3  
 active_downloads = 0
 
 # --- STATE MANAGEMENT & QUEUE ---
@@ -90,17 +90,15 @@ async def get_info(req: VideoRequest, request: Request):
         'quiet': True, 
         'no_warnings': True, 
         'extract_flat': False,
-        'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'}
+        'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     }
     
-    # Use cookies if available to prevent generic blocks
     if os.path.exists('cookies.txt'):
         ydl_opts['cookiefile'] = 'cookies.txt'
     
     try:
         info = await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(ydl_opts).extract_info(req.url, download=False))
         
-        # GUARD: Max Duration Check
         duration = info.get('duration', 0)
         if duration > MAX_DURATION_SECONDS:
             raise HTTPException(status_code=400, detail=f"Video is too long. Max duration is {MAX_DURATION_SECONDS/3600} hours.")
@@ -114,11 +112,11 @@ async def get_info(req: VideoRequest, request: Request):
             "sizes": calculate_sizes(info)
         }
     except Exception as e:
-        # COBALT FALLBACK: If yt-dlp gets IP banned by YouTube, provide dummy info to allow the download to proceed!
+        # MAGIC YOUTUBE FALLBACK: If yt-dlp gets IP banned, provide dummy info to allow download to proceed!
         if is_youtube_url(req.url):
-            logger.warning("YouTube info extraction blocked. Using Cobalt API fallback.")
+            logger.warning("YouTube info extraction blocked. Using Cobalt API fallback for info.")
             return {
-                "title": "YouTube Video (Cobalt Routing)",
+                "title": "YouTube Video (Cobalt Fallback)",
                 "thumbnail": "https://www.youtube.com/img/desktop/yt_1200.png",
                 "duration": "Unknown",
                 "uploader": "YouTube Creator",
@@ -131,39 +129,42 @@ async def get_info(req: VideoRequest, request: Request):
 def download_video_task(url: str, task_id: str):
     global active_downloads
     
-    # 1. YOUTUBE FALLBACK ROUTE (Using Cobalt API)
+    # ==========================================
+    # 1. YOUTUBE FALLBACK (USING 'REQUESTS' INSTEAD OF 'URLLIB' TO FIX 0% HANG)
+    # ==========================================
     if is_youtube_url(url):
         logger.info(f"Using Cobalt API Bypass for YouTube: {url}")
         temp_filepath = os.path.join(TEMP_DIR, f"{task_id}.mp4")
         try:
-            # Ask Cobalt for the direct video link
-            cobalt_req = urllib.request.Request(
-                'https://api.cobalt.tools/api/json',
-                data=json.dumps({"url": url}).encode('utf-8'),
-                headers={
-                    'Accept': 'application/json', 
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-                }
-            )
-            with urllib.request.urlopen(cobalt_req) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                if data.get('status') == 'error':
-                    raise Exception(data.get('text', 'Cobalt API Error'))
-                download_url = data['url']
+            # Ask Cobalt for the direct video link using the official instance
+            headers = {
+                'Accept': 'application/json', 
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+            }
+            payload = {"url": url}
             
-            # Stream the video from Cobalt to Render server safely
+            # Use co.wuk.sh as it is the primary stable instance for Cobalt
+            cobalt_response = requests.post('https://co.wuk.sh/api/json', json=payload, headers=headers, timeout=15)
+            cobalt_response.raise_for_status()
+            data = cobalt_response.json()
+            
+            if data.get('status') == 'error':
+                raise Exception(data.get('text', 'Cobalt API Error'))
+                
+            download_url = data['url']
+            
+            # Stream the video using the much more robust requests library
             download_progress[task_id] = {"status": "downloading", "percent": 0}
-            dl_req = urllib.request.Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
+            dl_resp = requests.get(download_url, stream=True, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
+            dl_resp.raise_for_status()
             
-            with urllib.request.urlopen(dl_req) as response:
-                total_size = int(response.headers.get('content-length', 0))
-                downloaded = 0
-                with open(temp_filepath, 'wb') as f:
-                    while True:
-                        chunk = response.read(16384) # Download in 16KB chunks
-                        if not chunk:
-                            break
+            total_size = int(dl_resp.headers.get('content-length', 0))
+            downloaded = 0
+            
+            with open(temp_filepath, 'wb') as f:
+                for chunk in dl_resp.iter_content(chunk_size=16384):
+                    if chunk: # Filter out keep-alive new chunks
                         f.write(chunk)
                         downloaded += len(chunk)
                         if total_size > 0:
@@ -177,9 +178,11 @@ def download_video_task(url: str, task_id: str):
             download_progress[task_id] = {"status": "error", "message": str(e)}
         finally:
             active_downloads -= 1
-        return # Exit the function here for YouTube
+        return
 
-    # 2. STANDARD YT-DLP ROUTE (For Instagram, TikTok, X)
+    # ==========================================
+    # 2. STANDARD YT-DLP LOGIC FOR INSTAGRAM/TIKTOK/TWITTER
+    # ==========================================
     temp_filepath = os.path.join(TEMP_DIR, f"{task_id}.%(ext)s")
     
     def progress_hook(d):
@@ -199,7 +202,7 @@ def download_video_task(url: str, task_id: str):
         'merge_output_format': 'mp4',
         'progress_hooks': [progress_hook],
         'noplaylist': True,
-        'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'}
+        'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     }
     
     if os.path.exists('cookies.txt'):
@@ -230,7 +233,6 @@ def download_video_task(url: str, task_id: str):
 async def start_download(req: VideoRequest, background_tasks: BackgroundTasks):
     global active_downloads
     
-    # GUARD: Concurrent Rate Limiter
     if active_downloads >= MAX_CONCURRENT_DOWNLOADS:
         raise HTTPException(status_code=429, detail="Server is currently at maximum capacity. Please try again in a few minutes.")
         
@@ -238,7 +240,6 @@ async def start_download(req: VideoRequest, background_tasks: BackgroundTasks):
     task_id = str(uuid.uuid4())
     download_progress[task_id] = {"status": "starting", "percent": 0}
     
-    # QUEUE: Run the heavy download in the background
     background_tasks.add_task(download_video_task, req.url, task_id)
     return {"task_id": task_id}
 
@@ -260,7 +261,7 @@ async def get_file(task_id: str):
         file_path, 
         media_type='application/octet-stream', 
         filename=os.path.basename(file_path),
-        background=BackgroundTasks([lambda: os.remove(file_path)]) # Auto-cleanup
+        background=BackgroundTasks([lambda: os.remove(file_path)]) 
     )
 
 @app.post("/api/analyze")
@@ -298,6 +299,5 @@ async def analyze_content(req: AIRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    # Dynamic port setup for Render compatibility
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
