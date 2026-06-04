@@ -4,4 +4,3 @@ pydantic
 yt-dlp
 requests
 python-multipart
-google-generativeai
