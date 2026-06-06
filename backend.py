@@ -5,6 +5,7 @@ import time
 import base64
 import asyncio
 import requests
+import random
 from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,8 +21,10 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 COOKIE_FILE = os.path.join(os.getcwd(), "cookies.txt")
-# UPGRADE: Fetch Proxy URL from Environment Variables
-PROXY_URL = os.getenv("PROXY_URL", "") 
+
+# Fetch Proxy List and parse it into a Python list
+PROXY_LIST_ENV = os.getenv("PROXY_LIST", "") 
+PROXIES = [p.strip() for p in PROXY_LIST_ENV.split(",") if p.strip()]
 
 # Global memory states
 tasks_progress = {}
@@ -52,10 +55,10 @@ async def lifespan(app: FastAPI):
     print("🚀 Booting Universal Extractor...")
     check_dependencies()
     
-    if PROXY_URL:
-        print("🛡️ PROXY ROUTING ENABLED: Shielding server IP.")
+    if PROXIES:
+        print(f"🛡️ PROXY ROTATION ENABLED: Loaded {len(PROXIES)} proxies into the pool.")
     else:
-        print("⚠️ NO PROXY DETECTED: Server IP is exposed to platforms.")
+        print("⚠️ NO PROXIES DETECTED: Server IP is completely exposed.")
 
     cookie_b64 = os.getenv("YOUTUBE_COOKIES_BASE64", "")
     if cookie_b64:
@@ -159,11 +162,12 @@ def progress_hook(d):
     elif d['status'] == 'finished':
         tasks_progress[task_id] = {'status': 'processing', 'progress': 100, 'speed': 'Merging...'}
 
-def get_base_ydl_opts():
+def get_base_ydl_opts(proxy_url=None):
+    """Generates options, applying a specific proxy if provided."""
     opts = {
         'quiet': True,
         'no_warnings': True,
-        'source_address': '0.0.0.0', # Force IPv4
+        'source_address': '0.0.0.0', 
         'extractor_args': {
             'youtube': {
                 'player_client': ['default', 'ios', 'android', 'web'] 
@@ -175,53 +179,85 @@ def get_base_ydl_opts():
         'sleep_requests': 1,
     }
     
-    # UPGRADE: Inject proxy if it exists
-    if PROXY_URL:
-        opts['proxy'] = PROXY_URL
+    if proxy_url:
+        opts['proxy'] = proxy_url
         
     if os.path.exists(COOKIE_FILE):
         opts['cookiefile'] = COOKIE_FILE
     return opts
 
+def get_proxy_pool(url: str):
+    """
+    Returns a shuffled list of proxies if it's YouTube. 
+    If not YouTube, returns [None] so it bypasses proxies entirely.
+    """
+    is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+    if is_youtube and PROXIES:
+        pool = list(PROXIES)
+        random.shuffle(pool)
+        return pool
+    return [None]
+
 # --- 4. API ENDPOINTS ---
 @app.post("/api/info")
 def get_video_info(req: VideoRequest):
-    ydl_opts = get_base_ydl_opts()
-    ydl_opts['extract_flat'] = False
+    pool = get_proxy_pool(req.url)
+    last_error = ""
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(req.url, download=False)
-            return {
-                "title": info.get('title', 'Unknown Title'),
-                "thumbnail": info.get('thumbnail', ''),
-                "duration": info.get('duration_string', 'Unknown'),
-                "uploader": info.get('uploader', 'Unknown'),
-                "platform": info.get('extractor', 'Unknown'),
-                "sizes": calculate_sizes(info)
-            }
-    except Exception as e:
-        error_msg = str(e)
-        if "Sign in to confirm" in error_msg or "403" in error_msg or "Video unavailable" in error_msg: 
-            raise HTTPException(status_code=403, detail="BOT_BLOCKED")
-        raise HTTPException(status_code=400, detail=error_msg)
+    # Failover Loop: Try proxies until one works
+    for proxy in pool:
+        ydl_opts = get_base_ydl_opts(proxy)
+        ydl_opts['extract_flat'] = False
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(req.url, download=False)
+                return {
+                    "title": info.get('title', 'Unknown Title'),
+                    "thumbnail": info.get('thumbnail', ''),
+                    "duration": info.get('duration_string', 'Unknown'),
+                    "uploader": info.get('uploader', 'Unknown'),
+                    "platform": info.get('extractor', 'Unknown'),
+                    "sizes": calculate_sizes(info)
+                }
+        except Exception as e:
+            last_error = str(e)
+            print(f"⚠️ Proxy/Connection failed for info: {last_error}")
+            continue # Try next proxy in the list
+
+    # If the loop finishes and nothing returned, all proxies failed.
+    if "Sign in to confirm" in last_error or "403" in last_error or "Video unavailable" in last_error: 
+        raise HTTPException(status_code=403, detail="BOT_BLOCKED")
+    raise HTTPException(status_code=400, detail=last_error)
 
 @app.post("/api/download")
 def download_video(req: DownloadRequest, background_tasks: BackgroundTasks):
-    
-    init_opts = get_base_ydl_opts()
-    try:
-        with yt_dlp.YoutubeDL(init_opts) as ydl:
-            info = ydl.extract_info(req.url, download=False)
-            raw_video_id = info.get('id', 'task')
-            task_id = f"{raw_video_id}_{int(time.time())}" 
-            video_to_task[raw_video_id] = task_id
-            tasks_progress[task_id] = {'status': 'starting', 'progress': 0, 'speed': 'Initializing...'}
-    except Exception as e:
-        error_msg = str(e)
-        if "Sign in to confirm" in error_msg or "403" in error_msg or "Video unavailable" in error_msg: 
+    pool = get_proxy_pool(req.url)
+    working_proxy = None
+    raw_video_id = ""
+    last_error = ""
+
+    # Phase 1: Find a working proxy to initialize the download
+    for proxy in pool:
+        init_opts = get_base_ydl_opts(proxy)
+        try:
+            with yt_dlp.YoutubeDL(init_opts) as ydl:
+                info = ydl.extract_info(req.url, download=False)
+                raw_video_id = info.get('id', 'task')
+                working_proxy = proxy
+                break # We found a working connection!
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    if not raw_video_id:
+        if "Sign in to confirm" in last_error or "403" in last_error or "Video unavailable" in last_error: 
             raise HTTPException(status_code=403, detail="BOT_BLOCKED")
-        raise HTTPException(status_code=400, detail=error_msg)
+        raise HTTPException(status_code=400, detail=last_error)
+
+    task_id = f"{raw_video_id}_{int(time.time())}" 
+    video_to_task[raw_video_id] = task_id
+    tasks_progress[task_id] = {'status': 'starting', 'progress': 0, 'speed': 'Initializing...'}
 
     format_str = 'bestvideo+bestaudio/best'
     postprocessors = []
@@ -233,28 +269,39 @@ def download_video(req: DownloadRequest, background_tasks: BackgroundTasks):
         format_str = 'bestaudio/best'
         postprocessors = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
 
-    ydl_opts = get_base_ydl_opts()
-    ydl_opts.update({
-        'format': format_str,
-        'merge_output_format': 'mp4' if req.quality != "audio" else None,
-        'outtmpl': os.path.join(TEMP_DIR, f'{task_id}.%(ext)s'),
-        'logger': QuietLogger(),
-        'progress_hooks': [progress_hook],
-        'restrictfilenames': True,
-    })
-    if postprocessors: ydl_opts['postprocessors'] = postprocessors
-
     def run_download():
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(req.url, download=True)
-                final_filename = ydl.prepare_filename(info)
-                if req.quality == "audio": final_filename = final_filename.rsplit('.', 1)[0] + '.mp3'
-                task_files[task_id] = final_filename
-                tasks_progress[task_id] = {'status': 'finished', 'progress': 100, 'speed': 'Complete'}
-        except Exception as e:
-            tasks_progress[task_id] = {'status': 'error', 'progress': 0, 'speed': 'Error'}
-            print(f"Background download error: {e}")
+        # Phase 2: Create a priority list. Try the working_proxy first. 
+        # If it crashes mid-download (e.g. 2GB limit reached), try the rest.
+        remaining_proxies = [working_proxy] + [p for p in pool if p != working_proxy]
+        
+        for p in remaining_proxies:
+            dl_opts = get_base_ydl_opts(p)
+            dl_opts.update({
+                'format': format_str,
+                'merge_output_format': 'mp4' if req.quality != "audio" else None,
+                'outtmpl': os.path.join(TEMP_DIR, f'{task_id}.%(ext)s'),
+                'logger': QuietLogger(),
+                'progress_hooks': [progress_hook],
+                'restrictfilenames': True,
+            })
+            if postprocessors: dl_opts['postprocessors'] = postprocessors
+
+            try:
+                with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                    info = ydl.extract_info(req.url, download=True)
+                    final_filename = ydl.prepare_filename(info)
+                    if req.quality == "audio": final_filename = final_filename.rsplit('.', 1)[0] + '.mp3'
+                    
+                    task_files[task_id] = final_filename
+                    tasks_progress[task_id] = {'status': 'finished', 'progress': 100, 'speed': 'Complete'}
+                    return # Exit function on success
+            except Exception as e:
+                print(f"⚠️ Download crash with proxy {p}. Error: {e}")
+                tasks_progress[task_id] = {'status': 'downloading', 'progress': tasks_progress.get(task_id, {}).get('progress', 0), 'speed': 'Switching proxy...'}
+                continue # The proxy died mid-download. yt-dlp saves the partial .part file, so the next proxy will just resume where this one left off!
+
+        # If it loops through every single proxy and they all fail
+        tasks_progress[task_id] = {'status': 'error', 'progress': 0, 'speed': 'All proxies exhausted.'}
 
     background_tasks.add_task(run_download)
     return {"status": "started", "task_id": task_id}
