@@ -20,6 +20,8 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 COOKIE_FILE = os.path.join(os.getcwd(), "cookies.txt")
+# UPGRADE: Fetch Proxy URL from Environment Variables
+PROXY_URL = os.getenv("PROXY_URL", "") 
 
 # Global memory states
 tasks_progress = {}
@@ -50,6 +52,11 @@ async def lifespan(app: FastAPI):
     print("🚀 Booting Universal Extractor...")
     check_dependencies()
     
+    if PROXY_URL:
+        print("🛡️ PROXY ROUTING ENABLED: Shielding server IP.")
+    else:
+        print("⚠️ NO PROXY DETECTED: Server IP is exposed to platforms.")
+
     cookie_b64 = os.getenv("YOUTUBE_COOKIES_BASE64", "")
     if cookie_b64:
         try:
@@ -64,8 +71,6 @@ async def lifespan(app: FastAPI):
             print("✅ YouTube Cookies loaded securely.")
         except Exception as e:
             print(f"⚠️ Failed to decode YOUTUBE_COOKIES_BASE64: {e}")
-    else:
-        print("⚠️ No YOUTUBE_COOKIES_BASE64 found.")
 
     sweeper_task = asyncio.create_task(auto_sweeper())
     yield
@@ -158,8 +163,22 @@ def get_base_ydl_opts():
     opts = {
         'quiet': True,
         'no_warnings': True,
-        # THE FIX: Removed the 'player_client=android,ios' extractor arg entirely!
+        'source_address': '0.0.0.0', # Force IPv4
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['default', 'ios', 'android', 'web'] 
+            }
+        },
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        },
+        'sleep_requests': 1,
     }
+    
+    # UPGRADE: Inject proxy if it exists
+    if PROXY_URL:
+        opts['proxy'] = PROXY_URL
+        
     if os.path.exists(COOKIE_FILE):
         opts['cookiefile'] = COOKIE_FILE
     return opts
@@ -183,7 +202,8 @@ def get_video_info(req: VideoRequest):
             }
     except Exception as e:
         error_msg = str(e)
-        if "Sign in to confirm" in error_msg: raise HTTPException(status_code=403, detail="BOT_BLOCKED")
+        if "Sign in to confirm" in error_msg or "403" in error_msg or "Video unavailable" in error_msg: 
+            raise HTTPException(status_code=403, detail="BOT_BLOCKED")
         raise HTTPException(status_code=400, detail=error_msg)
 
 @app.post("/api/download")
@@ -199,7 +219,8 @@ def download_video(req: DownloadRequest, background_tasks: BackgroundTasks):
             tasks_progress[task_id] = {'status': 'starting', 'progress': 0, 'speed': 'Initializing...'}
     except Exception as e:
         error_msg = str(e)
-        if "Sign in to confirm" in error_msg: raise HTTPException(status_code=403, detail="BOT_BLOCKED")
+        if "Sign in to confirm" in error_msg or "403" in error_msg or "Video unavailable" in error_msg: 
+            raise HTTPException(status_code=403, detail="BOT_BLOCKED")
         raise HTTPException(status_code=400, detail=error_msg)
 
     format_str = 'bestvideo+bestaudio/best'
