@@ -2,6 +2,8 @@ import os
 import re
 import shutil
 import time
+import base64
+import asyncio
 import requests
 from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -16,13 +18,12 @@ from contextlib import asynccontextmanager
 TEMP_DIR = os.path.join(os.getcwd(), "temp_downloads")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# SECURITY: Use environment variables
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # Global memory states
 tasks_progress = {}
 task_files = {} 
-video_to_task = {} # NEW FIX: Maps yt-dlp internal IDs to our secure Task IDs
+video_to_task = {} 
 
 def check_dependencies():
     if not shutil.which("ffmpeg"):
@@ -30,23 +31,59 @@ def check_dependencies():
     else:
         print(f"✅ FFmpeg detected. Server ready.")
 
+async def auto_sweeper():
+    """UPGRADE: Automatically deletes files older than 2 hours to prevent Render disk space crashes."""
+    while True:
+        try:
+            current_time = time.time()
+            for filename in os.listdir(TEMP_DIR):
+                filepath = os.path.join(TEMP_DIR, filename)
+                if os.path.isfile(filepath):
+                    # If file is older than 2 hours (7200 seconds)
+                    if current_time - os.path.getmtime(filepath) > 7200:
+                        os.remove(filepath)
+                        print(f"🧹 Auto-Sweeper deleted old file: {filename}")
+        except Exception as e:
+            print(f"Sweeper error: {e}")
+        await asyncio.sleep(3600) # Run every hour
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print("🚀 Booting Universal Extractor...")
     check_dependencies()
+    
+    # UPGRADE: Secure Cookie Injection
+    # Decodes cookies from a Render Environment Variable to prevent GitHub leaks
+    cookie_b64 = os.getenv("YOUTUBE_COOKIES_BASE64", "")
+    if cookie_b64:
+        try:
+            with open("cookies.txt", "wb") as f:
+                f.write(base64.b64decode(cookie_b64))
+            print("✅ YouTube Cookies loaded securely from Environment Variable.")
+        except Exception as e:
+            print(f"⚠️ Failed to decode YOUTUBE_COOKIES_BASE64: {e}")
+    else:
+        print("⚠️ No YOUTUBE_COOKIES_BASE64 found. YouTube bot protection may trigger.")
+
+    # Start the background auto-sweeper
+    sweeper_task = asyncio.create_task(auto_sweeper())
+    
     yield
-    # Security/Maintenance: Wipe temp files on server shutdown
+    
+    # Cleanup on shutdown
+    sweeper_task.cancel()
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
 
 app = FastAPI(title="Universal Extractor API", lifespan=lifespan)
 
-# CORS: Update with your Vercel URL
+# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173", 
         "http://127.0.0.1:5173",
-        "https://universal-extractor-ui.vercel.app" # <-- Update this later
+        "https://universal-extractor-ui.vercel.app"
     ], 
     allow_credentials=True,
     allow_methods=["*"],
@@ -72,22 +109,17 @@ class AIRequest(BaseModel):
 
 # --- 3. HELPER FUNCTIONS ---
 def cleanup_task_data(task_id: str, filepath: str):
-    """Deletes files from the server AND clears memory to prevent RAM leaks."""
     try:
         if os.path.exists(filepath):
             os.remove(filepath)
-            print(f"🧹 Server cleanup: Deleted {filepath}")
             
-        # Prevent memory leaks
         if task_id in tasks_progress: del tasks_progress[task_id]
         if task_id in task_files: del task_files[task_id]
         
-        # Clean up the mapping dictionary
         keys_to_delete = [k for k, v in video_to_task.items() if v == task_id]
         for k in keys_to_delete: del video_to_task[k]
-            
-    except Exception as e:
-        print(f"Cleanup error: {e}")
+    except Exception:
+        pass
 
 def calculate_sizes(info):
     formats = info.get('formats', [])
@@ -126,7 +158,6 @@ def strip_ansi(text):
     return ansi_escape.sub('', text)
 
 def progress_hook(d):
-    """FIX: Uses the mapping dictionary to find the correct secure task ID."""
     raw_video_id = d.get('info_dict', {}).get('id')
     task_id = video_to_task.get(raw_video_id)
     
@@ -145,7 +176,16 @@ def progress_hook(d):
 
 @app.post("/api/info")
 def get_video_info(req: VideoRequest):
-    ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': False}
+    ydl_opts = {
+        'quiet': True, 
+        'no_warnings': True, 
+        'extract_flat': False,
+        'extractor_args': {'youtube': ['player_client=android,ios']}
+    }
+    
+    if os.path.exists('cookies.txt'):
+        ydl_opts['cookiefile'] = 'cookies.txt'
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(req.url, download=False)
@@ -158,7 +198,10 @@ def get_video_info(req: VideoRequest):
                 "sizes": calculate_sizes(info)
             }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to extract info: {str(e)}")
+        error_msg = str(e)
+        if "Sign in to confirm" in error_msg:
+            raise HTTPException(status_code=403, detail="BOT_BLOCKED")
+        raise HTTPException(status_code=400, detail=error_msg)
 
 @app.post("/api/download")
 def download_video(req: DownloadRequest, background_tasks: BackgroundTasks):
@@ -173,16 +216,21 @@ def download_video(req: DownloadRequest, background_tasks: BackgroundTasks):
         postprocessors = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
 
     try:
-        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+        init_opts = {'quiet': True, 'extractor_args': {'youtube': ['player_client=android,ios']}}
+        if os.path.exists('cookies.txt'): init_opts['cookiefile'] = 'cookies.txt'
+        
+        with yt_dlp.YoutubeDL(init_opts) as ydl:
             info = ydl.extract_info(req.url, download=False)
             raw_video_id = info.get('id', 'task')
-            task_id = f"{raw_video_id}_{int(time.time())}" # Secure Unique ID
+            task_id = f"{raw_video_id}_{int(time.time())}" 
             
-            # NEW FIX: Map it so the hook can find it
             video_to_task[raw_video_id] = task_id
             tasks_progress[task_id] = {'status': 'starting', 'progress': 0, 'speed': 'Initializing...'}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Target analysis failed: {str(e)}")
+        error_msg = str(e)
+        if "Sign in to confirm" in error_msg:
+            raise HTTPException(status_code=403, detail="BOT_BLOCKED")
+        raise HTTPException(status_code=400, detail=error_msg)
 
     file_template = os.path.join(TEMP_DIR, f'{task_id}.%(ext)s')
     
@@ -195,8 +243,10 @@ def download_video(req: DownloadRequest, background_tasks: BackgroundTasks):
         'logger': QuietLogger(),
         'progress_hooks': [progress_hook],
         'concurrent_fragment_downloads': 16,
-        'restrictfilenames': True # NEW FIX: Prevents server crashes from bad characters
+        'restrictfilenames': True,
+        'extractor_args': {'youtube': ['player_client=android,ios']}
     }
+    if os.path.exists('cookies.txt'): ydl_opts['cookiefile'] = 'cookies.txt'
     if postprocessors: ydl_opts['postprocessors'] = postprocessors
 
     def run_download():
@@ -259,7 +309,6 @@ def generate_ai_kit(req: AIRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI Generation Failed: {str(e)}")
 
-# NEW FIX: Correct Host and Dynamic Port for Render Deployment
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("backend:app", host="0.0.0.0", port=port, reload=False)
